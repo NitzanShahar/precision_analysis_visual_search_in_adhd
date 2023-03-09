@@ -1,0 +1,193 @@
+---
+title: "Report (V1)"
+date: today
+
+format: 
+  docx:
+    toc: true
+    echo: false
+    message: false
+    warning: false
+    fig.width: 6
+---
+
+```{r setup}
+#| include: false
+library(tidyverse)
+library(patchwork)
+library(datawizard)
+library(tidybayes)
+library(ggdist)
+library(flextable)
+
+library(lmerTest)
+afex::set_effects_contrasts()
+library(brms)
+library(brms.exgaussian)
+library(bayestestR)
+
+library(performance)
+library(parameters)
+library(emmeans)
+
+data_clean <- readRDS("data/data_clean.rds")
+mod_stepB <- readRDS("data/mod_stepB.Rds")
+```
+
+## Trial or half-block?
+
+As a simple examination of which model should be used, I fit two simple models (no random effects) - a model with a (log) linear effect of trial on RT, and a model with a dummy variable for the half-block:
+
+```{r}
+#| echo: true
+m_lin <- lm(log(RespRT) ~ trial * distPresence, data = data_clean)
+m_step <- lm(log(RespRT) ~ block_half * distPresence, data = data_clean)
+```
+
+```{r}
+compare_performance(m_lin, m_step) |> 
+  mutate(Name = c("Linear", "Half-Block")) |>
+  select(Name, BIC, BIC_wt) |>
+  format() |> 
+  flextable() |> autofit()
+```
+
+The BIC weights tell us that there is no clear preference for using a linear model over a half-block model.
+
+Overall, it seems like both don't fully capture the non-linear effect of `trial` on RTs (seen here in the loess / moving average lines). (Black lines are the loess / moving average per participant).
+
+```{r}
+ggplot(data_clean, aes(trial, RespRT, color = distPresence)) +
+  facet_grid(~distPresence) +
+  # geom_point(shape = 16, alpha = 0.1) +
+  geom_smooth(aes(group = participant), se = FALSE, color = "black", linewidth = 0.5) +
+  ggnewscale::new_scale_color() +
+  geom_smooth(aes(color = "Loess"), se = FALSE, method = "loess") +
+  geom_line(aes(y = exp(predict(m_lin)), color = "Linear"), linewidth = 1) +
+  geom_line(aes(y = exp(predict(m_step)), color = "Step"), linewidth = 1) +
+  NULL
+```
+
+Using a hierarchical (log) linear model:
+
+```{r}
+#| echo: true
+mod_step <- lmer(log(RespRT) ~ distPresence * block_half + 
+                   (block_half * distPresence | participant),
+                 data = data_clean)
+```
+
+We find essentially the same results as your initial ANOVA:
+
+```{r}
+anova(mod_step, type = 3) |> 
+  tibble::rownames_to_column("Term") |> 
+  mutate(across(where(is.numeric), scales::number_format(0.001))) |> 
+  flextable() |> autofit()
+```
+
+(Of course tests have very low power.)
+
+
+## Reliability 
+
+We now examine the reliability of the interaction effect by using random co-variances of the interaction effect between sessions:
+
+```{r}
+#| echo: true
+mod_stepR <- lmer(log(RespRT) ~ session * distPresence * block_half + 
+                    # This is where the magic happens
+                   (0 + session / (block_half * distPresence) | participant), 
+                 data = data_clean)
+```
+
+
+```{r}
+VarCorr(mod_stepR)$participant |> 
+  attr("correlation") |> 
+  as.data.frame() |> 
+  mutate(across(everything(), \(x) scales::number(x, accuracy = 0.01))) |> 
+  tibble::rownames_to_column("Random") |> 
+  flextable() |> 
+  bg(1, 3, bg = "red") |> 
+  bg(2, 2, bg = "red") |> 
+  bg(3, 5, bg = "blue") |> 
+  bg(4, 4, bg = "blue") |> 
+  bg(5, 7, bg = "orange") |> 
+  bg(6, 6, bg = "orange") |> 
+  bg(7, 9, bg = "green") |> 
+  bg(8, 8, bg = "green")
+```
+
+- RED: Reliability of overall means between sessions.
+- BLUE: Reliability of block-half effect between sessions.
+- ORANGE: Reliability of the distractor effect between sessions.
+- GREEN: Reliability of the interaction between sessions.
+
+Reliability is low, but do keep in mind that $N=8$, so these results are perhaps not very informative.
+
+## Mu & Tau (Bayesian Analysis)
+
+I next fit a ex-Gaussian model with Mu and Tau as free parameters.
+
+(I set some loose priors.)
+
+### Model diagnostics
+
+Pretty good:
+
+```{r}
+diagnostic_posterior(mod_stepB) |> # RHat / ESS
+  flextable() |> autofit()
+
+pp_check(mod_stepB)
+```
+
+### Effects 
+
+```{r}
+describe_posterior(mod_stepB, effects = "fixed", 
+                   test = "pd", diagnostic = NULL) |> 
+  rename(Coef = Parameter) |> 
+  mutate(Parameter = ifelse(str_detect(Coef, "tau"), "Tau", "Mu"),
+         .before = "Coef") |> 
+  mutate(Coef = str_remove(Coef, "^b_") |> str_remove("^tau_")) |> 
+  arrange(Parameter, Coef) |> 
+  insight::format_table() |> 
+  flextable() |> autofit()
+```
+
+(*Note that the $\tau$ parameters are on the $log_e$ scale.*)
+
+It seems like the interaction is on Mu, though there might be a main effect for half-block on Tau as well.
+
+```{r}
+em_mu <- emmeans(mod_stepB, ~ distPresence + block_half, dpar = "mu")
+em_tau <- emmeans(mod_stepB, ~ distPresence + block_half, dpar = "tau") |> 
+  regrid()
+
+p_mu <- em_mu |> 
+  gather_emmeans_draws() |> 
+  group_by(distPresence, block_half) |> 
+  summarise(mu = posterior::rvar(.value)) |> 
+  ggplot(aes(block_half, ydist = mu, color = distPresence)) +
+  stat_slabinterval(.width = c(0.5, 0.95),
+                    slab_fill = "grey80",
+                    position = position_dodge(0.7), width = 0.7) +
+  theme_bw() +
+  labs(y = latex2exp::TeX("$\\mu$"))
+
+p_tau <- em_tau |> 
+  gather_emmeans_draws() |> 
+  group_by(distPresence, block_half) |> 
+  summarise(tau = posterior::rvar(.value)) |> 
+  ggplot(aes(block_half, ydist = tau, color = distPresence)) +
+  stat_slabinterval(.width = c(0.5, 0.95),
+                    slab_fill = "grey80",
+                    position = position_dodge(0.7), width = 0.7) +
+  theme_bw() +
+  labs(y = latex2exp::TeX("$\\tau$"))
+
+p_mu + p_tau + plot_layout(guides = "collect")
+```
+
