@@ -20,6 +20,7 @@ gen_X <- function(nsub, trials = 70, ...) {
 
 f_model <- 
   RespRT ~ 
+  0 + Intercept + 
   block_half * distPresence * group + 
   (block_half * distPresence | participant)
 
@@ -43,7 +44,7 @@ get_prior(f_model,
           data = data_clean2g)
 
 priors_for_gen <-
-  set_prior("constant(600)", class = "Intercept") + 
+  set_prior("constant(600)", coef = "Intercept") + 
   set_prior("constant(0)", coef = "block_halfSecond") + 
   set_prior("constant(25)", coef = "distPresencepresent") +
   set_prior("constant(100)", coef = "groupADHD") +
